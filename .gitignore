@@ -2,3 +2,12 @@
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Local build and runtime outputs
+artifacts/
+dist/
+node_modules/
+scripts/__pycache__/
+
+# Local firmware image staged for debugging
+elf/

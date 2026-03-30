@@ -2,34 +2,41 @@
 # Validate that the build and debug environment is correctly configured.
 set -euo pipefail
 
-LOG_DIR="$(dirname "$0")/../artifacts/logs"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/validate_env.log"
-
-exec > >(tee "$LOG_FILE") 2>&1
+source "$(dirname "$0")/common.sh"
+setup_log "validate_env.log"
 
 echo "Validating environment..."
+load_project_config
 
-# Read configuration
-CONFIG_FILE="$(dirname "$0")/../config/project.yaml"
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "Configuration file $CONFIG_FILE not found" >&2
-  exit 1
-fi
+require_config_value ELF_PATH
+require_config_value JLINK_GDB_SERVER_PATH
+require_config_value DEVICE
+require_config_value INTERFACE
+require_config_value SPEED
+require_config_value GDB_PATH
 
-ELF_PATH=$(grep '^ELF_PATH:' "$CONFIG_FILE" | awk '{print $2}')
-JLINK_GDB_SERVER_PATH=$(grep '^JLINK_GDB_SERVER_PATH:' "$CONFIG_FILE" | awk '{print $2}')
+JLINK_GDB_SERVER_BIN="$(resolve_executable "$JLINK_GDB_SERVER_PATH" || true)"
+GDB_BIN="$(resolve_executable "$GDB_PATH" || true)"
 
 echo "ELF_PATH=$ELF_PATH"
 echo "JLINK_GDB_SERVER_PATH=$JLINK_GDB_SERVER_PATH"
+echo "DEVICE=$DEVICE"
+echo "INTERFACE=$INTERFACE"
+echo "SPEED=$SPEED"
+echo "GDB_PATH=$GDB_PATH"
 
 if [[ ! -f "$ELF_PATH" ]]; then
   echo "ELF file not found at $ELF_PATH" >&2
   exit 1
 fi
 
-if [[ ! -x "$JLINK_GDB_SERVER_PATH" ]]; then
+if [[ -z "$JLINK_GDB_SERVER_BIN" ]]; then
   echo "J‑Link GDB server not found or not executable at $JLINK_GDB_SERVER_PATH" >&2
+  exit 1
+fi
+
+if [[ -z "$GDB_BIN" ]]; then
+  echo "GDB executable not found or not executable at $GDB_PATH" >&2
   exit 1
 fi
 
@@ -47,4 +54,23 @@ if ! command -v npm &>/dev/null; then
 fi
 echo "npm version: $(npm --version)"
 
+if ! command -v python3 &>/dev/null; then
+  echo "python3 not found" >&2
+  exit 1
+fi
+echo "python version: $(python3 --version)"
+
+if ! python3 - <<'PY'
+import importlib.util
+import sys
+sys.exit(0 if importlib.util.find_spec("yaml") else 1)
+PY
+then
+  echo "PyYAML module not found for python3" >&2
+  exit 1
+fi
+echo "python yaml module: available"
+
+echo "Resolved J-Link server: $JLINK_GDB_SERVER_BIN"
+echo "Resolved GDB binary: $GDB_BIN"
 echo "Environment validation succeeded."

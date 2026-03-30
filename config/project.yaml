@@ -3,19 +3,26 @@
 # Set these values before running Codex.  Use absolute paths to avoid
 # ambiguity.  Paths may include spaces but should not be quoted.
 
-ELF_PATH: '/absolute/path/to/your/firmware.elf'
+ELF_PATH: '/Volumes/电子尿袋/mcp_jlink_gdb_server/mcp-gdb_hc32_agent_serveer/elf/Z05_R_V1.5MT.elf'
 
 # Path to the J‑Link GDB server executable.  On Windows this might be
 # 'C:/Program Files/SEGGER/JLink/JLinkGDBServerCL.exe'; on Linux it might be
 # '/opt/SEGGER/JLink/JLinkGDBServer'.  Ensure the file is executable.
-JLINK_GDB_SERVER_PATH: '/absolute/path/to/JLinkGDBServer'
+JLINK_GDB_SERVER_PATH: '/Volumes/电子尿袋/Applications/SEGGER/JLink_V840/JLinkGDBServerCLExe'
 
 # Device name as understood by the J‑Link software.  Refer to SEGGER
 # documentation for supported devices.
-JLINK_DEVICE: 'MCU_Device_Name'
+JLINK_DEVICE: 'HC32F460XE'
+DEVICE: 'HC32F460XE'
 
 # Debug interface: SWD or JTAG.  Most Cortex‑M devices use SWD.
 JLINK_INTERFACE: 'SWD'
+INTERFACE: 'SWD'
 
 # Communication speed in kHz.  Adjust to suit your board.
 JLINK_SPEED_KHZ: 4000
+SPEED: 4000
+
+# Path to the GDB client executable used to drive the J-Link GDB server.
+# Set this to an absolute path when the toolchain is installed locally.
+GDB_PATH: '/opt/homebrew/bin/arm-none-eabi-gdb'

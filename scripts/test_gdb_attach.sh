@@ -4,37 +4,47 @@
 # the ELF_PATH is configured in project.yaml.
 set -euo pipefail
 
-LOG_DIR="$(dirname "$0")/../artifacts/logs"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/gdb_attach.log"
+source "$(dirname "$0")/common.sh"
+setup_log "gdb_attach.log"
 
-exec > >(tee "$LOG_FILE") 2>&1
+load_project_config
+require_config_value ELF_PATH
+require_config_value GDB_PATH
 
-CONFIG_FILE="$(dirname "$0")/../config/project.yaml"
-ELF_PATH=$(grep '^ELF_PATH:' "$CONFIG_FILE" | awk '{print $2}')
+GDB_BIN="$(resolve_executable "$GDB_PATH" || true)"
 
 if [[ ! -f "$ELF_PATH" ]]; then
   echo "ELF file not found at $ELF_PATH" >&2
   exit 1
 fi
 
-GDB=${GDB:-gdb}
-
-if ! command -v "$GDB" &>/dev/null; then
-  echo "GDB not found in PATH" >&2
+if [[ -z "$GDB_BIN" ]]; then
+  echo "GDB executable not found or not executable at $GDB_PATH" >&2
   exit 1
 fi
 
+GDB_CMDS="$(mktemp "$RUNTIME_DIR/gdb_cmds.XXXXXX")"
+cleanup() {
+  rm -f "$GDB_CMDS"
+}
+trap cleanup EXIT
+
 echo "Launching GDB and connecting to target..."
-cat >gdb_cmds.txt <<'GDBEOF'
+cat > "$GDB_CMDS" <<'GDBEOF'
+set confirm off
+set pagination off
 target remote localhost:2331
-monitor reset halt
+monitor halt
 info registers pc
+x/4wx $pc
 quit
 GDBEOF
 
-"$GDB" "$ELF_PATH" -batch -x gdb_cmds.txt
+"$GDB_BIN" "$ELF_PATH" -batch -x "$GDB_CMDS"
 
-rm -f gdb_cmds.txt
+if ! grep -Eq '\bpc\b[[:space:]]+0x[0-9a-fA-F]+' "$LOG_DIR/gdb_attach.log"; then
+  echo "GDB output did not contain a valid PC register value" >&2
+  exit 1
+fi
 
 echo "GDB attach script completed."

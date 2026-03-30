@@ -1,1419 +1,1112 @@
 #!/usr/bin/env node
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ErrorCode,
-  ListToolsRequestSchema,
-  McpError
-} from '@modelcontextprotocol/sdk/types.js';
-import { spawn, ChildProcess } from 'child_process';
-import * as readline from 'readline';
-import * as fs from 'fs';
-import * as path from 'path';
+import { spawn } from 'child_process';
+import path from 'path';
+import readline from 'readline';
 
-// Interface for GDB session
-interface GdbSession {
-  process: ChildProcess;
-  rl: readline.Interface;
-  ready: boolean;
-  id: string;
-  target?: string;
-  workingDir?: string;
+const SERVER_INFO = {
+  name: 'mcp-gdb-server',
+  version: '0.2.0',
+};
+
+const PROTOCOL_VERSION = '2025-03-26';
+const JSONRPC_VERSION = '2.0';
+const activeSessions = new Map();
+
+const TOOL_DEFS = [
+  {
+    name: 'gdb_start',
+    description: 'Start a new GDB session',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        gdbPath: {
+          type: 'string',
+          description: 'Path to the GDB executable (optional, defaults to gdb)',
+        },
+        workingDir: {
+          type: 'string',
+          description: 'Working directory for GDB (optional)',
+        },
+      },
+    },
+  },
+  {
+    name: 'gdb_load',
+    description: 'Load a program into GDB',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        program: { type: 'string', description: 'Path to the program to debug' },
+        arguments: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Command-line arguments for the program (optional)',
+        },
+      },
+      required: ['sessionId', 'program'],
+    },
+  },
+  {
+    name: 'gdb_command',
+    description: 'Execute a raw GDB console command',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        command: { type: 'string', description: 'GDB command to execute' },
+      },
+      required: ['sessionId', 'command'],
+    },
+  },
+  {
+    name: 'gdb_connect',
+    description: 'Connect a GDB session to a remote target',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        target: {
+          type: 'string',
+          description: 'Remote target endpoint, for example localhost:2331',
+        },
+        extendedRemote: {
+          type: 'boolean',
+          description: 'Use target extended-remote instead of target remote (optional)',
+        },
+      },
+      required: ['sessionId', 'target'],
+    },
+  },
+  {
+    name: 'gdb_read_register',
+    description: 'Read a single register value',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        register: { type: 'string', description: 'Register name to read' },
+      },
+      required: ['sessionId', 'register'],
+    },
+  },
+  {
+    name: 'gdb_read_memory',
+    description: 'Read memory using GDB examine syntax',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        address: { type: 'string', description: 'Memory address or expression to read from' },
+        format: {
+          type: 'string',
+          description: 'Display format and unit, for example wx or bx (optional)',
+        },
+        count: { type: 'number', description: 'Number of values to read (optional)' },
+      },
+      required: ['sessionId', 'address'],
+    },
+  },
+  {
+    name: 'gdb_terminate',
+    description: 'Terminate a GDB session',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'gdb_list_sessions',
+    description: 'List all active GDB sessions',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'gdb_attach',
+    description: 'Attach to a running process',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        pid: { type: 'number', description: 'Process ID to attach to' },
+      },
+      required: ['sessionId', 'pid'],
+    },
+  },
+  {
+    name: 'gdb_load_core',
+    description: 'Load a core dump file',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        program: { type: 'string', description: 'Path to the program executable' },
+        corePath: { type: 'string', description: 'Path to the core dump file' },
+      },
+      required: ['sessionId', 'program', 'corePath'],
+    },
+  },
+  {
+    name: 'gdb_set_breakpoint',
+    description: 'Set a breakpoint',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        location: {
+          type: 'string',
+          description: 'Breakpoint location (for example function name or file:line)',
+        },
+        condition: { type: 'string', description: 'Breakpoint condition (optional)' },
+      },
+      required: ['sessionId', 'location'],
+    },
+  },
+  {
+    name: 'gdb_continue',
+    description: 'Continue program execution',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'gdb_step',
+    description: 'Step program execution',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        instructions: {
+          type: 'boolean',
+          description: 'Step by instructions instead of source lines (optional)',
+        },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'gdb_next',
+    description: 'Step over function calls',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        instructions: {
+          type: 'boolean',
+          description: 'Step by instructions instead of source lines (optional)',
+        },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'gdb_finish',
+    description: 'Execute until the current function returns',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'gdb_backtrace',
+    description: 'Show call stack',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        full: {
+          type: 'boolean',
+          description: 'Show variables in each frame (optional)',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of frames to show (optional)',
+        },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'gdb_print',
+    description: 'Print value of expression',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        expression: { type: 'string', description: 'Expression to evaluate' },
+      },
+      required: ['sessionId', 'expression'],
+    },
+  },
+  {
+    name: 'gdb_examine',
+    description: 'Examine memory',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        expression: { type: 'string', description: 'Memory address or expression' },
+        format: {
+          type: 'string',
+          description: 'Display format (for example x for hex or i for instruction)',
+        },
+        count: { type: 'number', description: 'Number of units to display' },
+      },
+      required: ['sessionId', 'expression'],
+    },
+  },
+  {
+    name: 'gdb_info_registers',
+    description: 'Display registers',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        register: {
+          type: 'string',
+          description: 'Specific register to display (optional)',
+        },
+      },
+      required: ['sessionId'],
+    },
+  },
+  {
+    name: 'gdb_list_source',
+    description: 'List source code at the current location or a specified location',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string', description: 'GDB session ID' },
+        location: {
+          type: 'string',
+          description: 'Source location such as function name or file:line (optional)',
+        },
+      },
+      required: ['sessionId'],
+    },
+  },
+];
+
+function textResult(text) {
+  return {
+    content: [
+      {
+        type: 'text',
+        text,
+      },
+    ],
+  };
 }
 
-// Map to store active GDB sessions
-const activeSessions = new Map<string, GdbSession>();
+function errorResult(text) {
+  return {
+    content: [
+      {
+        type: 'text',
+        text,
+      },
+    ],
+    isError: true,
+  };
+}
 
 class GdbServer {
-  private server: Server;
-
   constructor() {
-    this.server = new Server(
-      {
-        name: 'mcp-gdb-server',
-        version: '0.1.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
-    );
+    this.buffer = Buffer.alloc(0);
+    this.queue = Promise.resolve();
 
-    this.setupToolHandlers();
-    
-    // Error handling
-    this.server.onerror = (error) => console.error('[MCP Error]', error);
+    process.stdin.on('data', (chunk) => {
+      this.buffer = Buffer.concat([this.buffer, chunk]);
+      this.drainMessages();
+    });
+
+    process.stdin.on('end', async () => {
+      await this.shutdown();
+    });
+
     process.on('SIGINT', async () => {
-      // Clean up all active GDB sessions
-      for (const [id, session] of activeSessions.entries()) {
-        await this.terminateGdbSession(id);
-      }
-      await this.server.close();
+      await this.shutdown();
+      process.exit(0);
+    });
+
+    process.on('SIGTERM', async () => {
+      await this.shutdown();
       process.exit(0);
     });
   }
 
-  private setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: 'gdb_start',
-          description: 'Start a new GDB session',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              gdbPath: {
-                type: 'string',
-                description: 'Path to the GDB executable (optional, defaults to "gdb")'
-              },
-              workingDir: {
-                type: 'string',
-                description: 'Working directory for GDB (optional)'
-              }
-            }
-          }
-        },
-        {
-          name: 'gdb_load',
-          description: 'Load a program into GDB',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              program: {
-                type: 'string',
-                description: 'Path to the program to debug'
-              },
-              arguments: {
-                type: 'array',
-                items: {
-                  type: 'string'
-                },
-                description: 'Command-line arguments for the program (optional)'
-              }
-            },
-            required: ['sessionId', 'program']
-          }
-        },
-        {
-          name: 'gdb_command',
-          description: 'Execute a GDB command',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              command: {
-                type: 'string',
-                description: 'GDB command to execute'
-              }
-            },
-            required: ['sessionId', 'command']
-          }
-        },
-        {
-          name: 'gdb_terminate',
-          description: 'Terminate a GDB session',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              }
-            },
-            required: ['sessionId']
-          }
-        },
-        {
-          name: 'gdb_list_sessions',
-          description: 'List all active GDB sessions',
-          inputSchema: {
-            type: 'object',
-            properties: {}
-          }
-        },
-        {
-          name: 'gdb_attach',
-          description: 'Attach to a running process',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              pid: {
-                type: 'number',
-                description: 'Process ID to attach to'
-              }
-            },
-            required: ['sessionId', 'pid']
-          }
-        },
-        {
-          name: 'gdb_load_core',
-          description: 'Load a core dump file',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              program: {
-                type: 'string',
-                description: 'Path to the program executable'
-              },
-              corePath: {
-                type: 'string',
-                description: 'Path to the core dump file'
-              }
-            },
-            required: ['sessionId', 'program', 'corePath']
-          }
-        },
-        {
-          name: 'gdb_set_breakpoint',
-          description: 'Set a breakpoint',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              location: {
-                type: 'string',
-                description: 'Breakpoint location (e.g., function name, file:line)'
-              },
-              condition: {
-                type: 'string',
-                description: 'Breakpoint condition (optional)'
-              }
-            },
-            required: ['sessionId', 'location']
-          }
-        },
-        {
-          name: 'gdb_continue',
-          description: 'Continue program execution',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              }
-            },
-            required: ['sessionId']
-          }
-        },
-        {
-          name: 'gdb_step',
-          description: 'Step program execution',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              instructions: {
-                type: 'boolean',
-                description: 'Step by instructions instead of source lines (optional)'
-              }
-            },
-            required: ['sessionId']
-          }
-        },
-        {
-          name: 'gdb_next',
-          description: 'Step over function calls',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              instructions: {
-                type: 'boolean',
-                description: 'Step by instructions instead of source lines (optional)'
-              }
-            },
-            required: ['sessionId']
-          }
-        },
-        {
-          name: 'gdb_finish',
-          description: 'Execute until the current function returns',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              }
-            },
-            required: ['sessionId']
-          }
-        },
-        {
-          name: 'gdb_backtrace',
-          description: 'Show call stack',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              full: {
-                type: 'boolean',
-                description: 'Show variables in each frame (optional)'
-              },
-              limit: {
-                type: 'number',
-                description: 'Maximum number of frames to show (optional)'
-              }
-            },
-            required: ['sessionId']
-          }
-        },
-        {
-          name: 'gdb_print',
-          description: 'Print value of expression',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              expression: {
-                type: 'string',
-                description: 'Expression to evaluate'
-              }
-            },
-            required: ['sessionId', 'expression']
-          }
-        },
-        {
-          name: 'gdb_examine',
-          description: 'Examine memory',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              expression: {
-                type: 'string',
-                description: 'Memory address or expression'
-              },
-              format: {
-                type: 'string',
-                description: 'Display format (e.g., "x" for hex, "i" for instruction)'
-              },
-              count: {
-                type: 'number',
-                description: 'Number of units to display'
-              }
-            },
-            required: ['sessionId', 'expression']
-          }
-        },
-        {
-          name: 'gdb_info_registers',
-          description: 'Display registers',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              register: {
-                type: 'string',
-                description: 'Specific register to display (optional)'
-              }
-            },
-            required: ['sessionId']
-          }
-        },
-        {
-          name: 'gdb_list_source',
-          description: 'List source code at current location or specified location, with VS Code integration',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              sessionId: {
-                type: 'string',
-                description: 'GDB session ID'
-              },
-              location: {
-                type: 'string',
-                description: 'Source location (e.g., function name, file:line, optional)'
-              },
-              lineCount: {
-                type: 'number',
-                description: 'Number of lines to show (optional, default is 10)'
-              }
-            },
-            required: ['sessionId']
-          }
-        }
-      ],
-    }));
+  async run() {
+    console.error('GDB MCP server running on stdio');
+  }
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      // Route the tool call to the appropriate handler based on the tool name
-      switch (request.params.name) {
-        case 'gdb_start':
-          return await this.handleGdbStart(request.params.arguments);
-        case 'gdb_load':
-          return await this.handleGdbLoad(request.params.arguments);
-        case 'gdb_command':
-          return await this.handleGdbCommand(request.params.arguments);
-        case 'gdb_terminate':
-          return await this.handleGdbTerminate(request.params.arguments);
-        case 'gdb_list_sessions':
-          return await this.handleGdbListSessions();
-        case 'gdb_attach':
-          return await this.handleGdbAttach(request.params.arguments);
-        case 'gdb_load_core':
-          return await this.handleGdbLoadCore(request.params.arguments);
-        case 'gdb_set_breakpoint':
-          return await this.handleGdbSetBreakpoint(request.params.arguments);
-        case 'gdb_continue':
-          return await this.handleGdbContinue(request.params.arguments);
-        case 'gdb_step':
-          return await this.handleGdbStep(request.params.arguments);
-        case 'gdb_next':
-          return await this.handleGdbNext(request.params.arguments);
-        case 'gdb_finish':
-          return await this.handleGdbFinish(request.params.arguments);
-        case 'gdb_backtrace':
-          return await this.handleGdbBacktrace(request.params.arguments);
-        case 'gdb_print':
-          return await this.handleGdbPrint(request.params.arguments);
-        case 'gdb_examine':
-          return await this.handleGdbExamine(request.params.arguments);
-        case 'gdb_info_registers':
-          return await this.handleGdbInfoRegisters(request.params.arguments);
-        case 'gdb_list_source':
-          return await this.handleGdbListSource(request.params.arguments);
-        default:
-          throw new McpError(
-            ErrorCode.MethodNotFound,
-            `Unknown tool: ${request.params.name}`
-          );
+  drainMessages() {
+    while (true) {
+      const headerEnd = this.buffer.indexOf('\r\n\r\n');
+      if (headerEnd === -1) {
+        return;
       }
+
+      const headerText = this.buffer.subarray(0, headerEnd).toString('utf8');
+      const headers = {};
+      for (const line of headerText.split('\r\n')) {
+        if (!line.trim()) {
+          continue;
+        }
+        const separator = line.indexOf(':');
+        if (separator === -1) {
+          continue;
+        }
+        const name = line.slice(0, separator).trim().toLowerCase();
+        const value = line.slice(separator + 1).trim();
+        headers[name] = value;
+      }
+
+      const contentLength = Number.parseInt(headers['content-length'] || '', 10);
+      if (!Number.isFinite(contentLength) || contentLength < 0) {
+        console.error('[MCP Error] Invalid Content-Length header');
+        this.buffer = Buffer.alloc(0);
+        return;
+      }
+
+      const totalLength = headerEnd + 4 + contentLength;
+      if (this.buffer.length < totalLength) {
+        return;
+      }
+
+      const body = this.buffer.subarray(headerEnd + 4, totalLength).toString('utf8');
+      this.buffer = this.buffer.subarray(totalLength);
+
+      let message;
+      try {
+        message = JSON.parse(body);
+      } catch (error) {
+        console.error('[MCP Error] Failed to parse JSON-RPC message:', error);
+        continue;
+      }
+
+      this.queue = this.queue
+        .then(() => this.handleEnvelope(message))
+        .catch((error) => {
+          console.error('[MCP Error]', error);
+        });
+    }
+  }
+
+  send(payload) {
+    const body = Buffer.from(JSON.stringify(payload), 'utf8');
+    process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
+    process.stdout.write(body);
+  }
+
+  sendResult(id, result) {
+    this.send({
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      result,
     });
   }
 
-  private async handleGdbStart(args: any) {
+  sendError(id, code, message) {
+    this.send({
+      jsonrpc: JSONRPC_VERSION,
+      id,
+      error: {
+        code,
+        message,
+      },
+    });
+  }
+
+  async handleEnvelope(message) {
+    if (!message || message.jsonrpc !== JSONRPC_VERSION || typeof message.method !== 'string') {
+      return;
+    }
+
+    const id = message.id;
+    const params = message.params || {};
+
+    try {
+      switch (message.method) {
+        case 'initialize':
+          if (id !== undefined) {
+            this.sendResult(id, {
+              protocolVersion: PROTOCOL_VERSION,
+              capabilities: {
+                tools: {},
+              },
+              serverInfo: SERVER_INFO,
+            });
+          }
+          return;
+
+        case 'notifications/initialized':
+          return;
+
+        case 'tools/list':
+          if (id !== undefined) {
+            this.sendResult(id, { tools: TOOL_DEFS });
+          }
+          return;
+
+        case 'tools/call':
+          if (id !== undefined) {
+            const result = await this.handleToolCall(params);
+            this.sendResult(id, result);
+          }
+          return;
+
+        default:
+          if (id !== undefined) {
+            this.sendError(id, -32601, `Method not found: ${message.method}`);
+          }
+      }
+    } catch (error) {
+      if (id !== undefined) {
+        this.sendError(id, -32000, error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+
+  async handleToolCall(params) {
+    const name = params.name;
+    const args = params.arguments || {};
+
+    switch (name) {
+      case 'gdb_start':
+        return this.handleGdbStart(args);
+      case 'gdb_load':
+        return this.handleGdbLoad(args);
+      case 'gdb_command':
+        return this.handleGdbCommand(args);
+      case 'gdb_connect':
+        return this.handleGdbConnect(args);
+      case 'gdb_read_register':
+        return this.handleGdbReadRegister(args);
+      case 'gdb_read_memory':
+        return this.handleGdbReadMemory(args);
+      case 'gdb_terminate':
+        return this.handleGdbTerminate(args);
+      case 'gdb_list_sessions':
+        return this.handleGdbListSessions();
+      case 'gdb_attach':
+        return this.handleGdbAttach(args);
+      case 'gdb_load_core':
+        return this.handleGdbLoadCore(args);
+      case 'gdb_set_breakpoint':
+        return this.handleGdbSetBreakpoint(args);
+      case 'gdb_continue':
+        return this.handleGdbContinue(args);
+      case 'gdb_step':
+        return this.handleGdbStep(args);
+      case 'gdb_next':
+        return this.handleGdbNext(args);
+      case 'gdb_finish':
+        return this.handleGdbFinish(args);
+      case 'gdb_backtrace':
+        return this.handleGdbBacktrace(args);
+      case 'gdb_print':
+        return this.handleGdbPrint(args);
+      case 'gdb_examine':
+        return this.handleGdbExamine(args);
+      case 'gdb_info_registers':
+        return this.handleGdbInfoRegisters(args);
+      case 'gdb_list_source':
+        return this.handleGdbListSource(args);
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  }
+
+  getSession(sessionId) {
+    return activeSessions.get(sessionId) || null;
+  }
+
+  getSessionOrError(sessionId) {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      return {
+        session: null,
+        response: errorResult(`No active GDB session with ID: ${sessionId}`),
+      };
+    }
+    return { session };
+  }
+
+  queueGdbCommand(session, command) {
+    const next = session.pending.then(() => this.runGdbCommand(session, command));
+    session.pending = next.catch(() => {});
+    return next;
+  }
+
+  async handleGdbStart(args) {
     const gdbPath = args.gdbPath || 'gdb';
     const workingDir = args.workingDir || process.cwd();
-    
-    // Create a unique session ID
     const sessionId = Date.now().toString();
-    
+
     try {
-      // Start GDB process with MI mode enabled for machine interface
-      const gdbProcess = spawn(gdbPath, ['--interpreter=mi'], {
+      const gdbProcess = spawn(gdbPath, ['--interpreter=mi2', '--quiet', '--nx'], {
         cwd: workingDir,
         env: process.env,
-        stdio: ['pipe', 'pipe', 'pipe']
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
-      
-      // Create readline interface for reading GDB output
+
       const rl = readline.createInterface({
         input: gdbProcess.stdout,
-        terminal: false
+        crlfDelay: Infinity,
       });
-      
-      // Create new GDB session
-      const session: GdbSession = {
+
+      const session = {
         process: gdbProcess,
         rl,
         ready: false,
         id: sessionId,
-        workingDir
+        target: undefined,
+        workingDir,
+        pending: Promise.resolve(),
       };
-      
-      // Store session in active sessions map
+
       activeSessions.set(sessionId, session);
-      
-      // Collect GDB output until ready
+
       let outputBuffer = '';
-      
-      // Wait for GDB to be ready (when it outputs the initial prompt)
-      await new Promise<void>((resolve, reject) => {
+
+      await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
+          cleanup();
           reject(new Error('GDB start timeout'));
-        }, 10000); // 10 second timeout
-        
-        rl.on('line', (line) => {
-          // Append line to output buffer
-          outputBuffer += line + '\n';
-          
-          // Check if GDB is ready (outputs prompt)
-          if (line.includes('(gdb)') || line.includes('^done')) {
-            clearTimeout(timeout);
+        }, 10000);
+
+        const onLine = (line) => {
+          const decodedLine = this.decodeMiOutputLine(line);
+          if (decodedLine.trim()) {
+            outputBuffer += decodedLine.endsWith('\n') ? decodedLine : `${decodedLine}\n`;
+          }
+
+          if (line.trim() === '(gdb)' || line.startsWith('^done')) {
             session.ready = true;
+            cleanup();
             resolve();
           }
-        });
-        
-        gdbProcess.stderr.on('data', (data) => {
+        };
+
+        const onStderr = (data) => {
           outputBuffer += `[stderr] ${data.toString()}\n`;
-        });
-        
-        gdbProcess.on('error', (err) => {
-          clearTimeout(timeout);
-          reject(err);
-        });
-        
-        gdbProcess.on('exit', (code) => {
-          clearTimeout(timeout);
+        };
+
+        const onError = (error) => {
+          cleanup();
+          reject(error);
+        };
+
+        const onExit = (code) => {
+          cleanup();
           if (!session.ready) {
             reject(new Error(`GDB process exited with code ${code}`));
           }
-        });
+        };
+
+        const cleanup = () => {
+          clearTimeout(timeout);
+          rl.removeListener('line', onLine);
+          gdbProcess.stderr.removeListener('data', onStderr);
+          gdbProcess.removeListener('error', onError);
+          gdbProcess.removeListener('exit', onExit);
+        };
+
+        rl.on('line', onLine);
+        gdbProcess.stderr.on('data', onStderr);
+        gdbProcess.on('error', onError);
+        gdbProcess.on('exit', onExit);
       });
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `GDB session started with ID: ${sessionId}\n\nOutput:\n${outputBuffer}`
-          }
-        ]
-      };
+
+      outputBuffer += await this.queueGdbCommand(session, 'set pagination off');
+      outputBuffer += outputBuffer.endsWith('\n') ? '' : '\n';
+      outputBuffer += await this.queueGdbCommand(session, 'set confirm off');
+
+      return textResult(`GDB session started with ID: ${sessionId}\n\nOutput:\n${outputBuffer}`);
     } catch (error) {
-      // Clean up if an error occurs
-      if (activeSessions.has(sessionId)) {
-        const session = activeSessions.get(sessionId)!;
-        session.process.kill();
+      const session = this.getSession(sessionId);
+      if (session) {
         session.rl.close();
+        if (!session.process.killed) {
+          session.process.kill();
+        }
         activeSessions.delete(sessionId);
       }
-      
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to start GDB: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
+
+      return errorResult(`Failed to start GDB: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private async handleGdbLoad(args: any) {
+  async handleGdbLoad(args) {
     const { sessionId, program, arguments: programArgs = [] } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
+    const resolved = this.getSessionOrError(sessionId);
+    if (!resolved.session) {
+      return resolved.response;
     }
-    
-    const session = activeSessions.get(sessionId)!;
-    
+
+    const session = resolved.session;
+
     try {
-      // Normalize path if working directory is set
-      const normalizedPath = session.workingDir && !path.isAbsolute(program) 
-        ? path.resolve(session.workingDir, program)
-        : program;
-      
-      // Update session target
+      const normalizedPath =
+        session.workingDir && !path.isAbsolute(program)
+          ? path.resolve(session.workingDir, program)
+          : program;
+
       session.target = normalizedPath;
-      
-      // Execute file command to load program
-      const loadCommand = `file "${normalizedPath}"`;
-      const loadOutput = await this.executeGdbCommand(session, loadCommand);
-      
-      // Set program arguments if provided
+      const loadOutput = await this.queueGdbCommand(session, `file "${normalizedPath}"`);
+
       let argsOutput = '';
-      if (programArgs.length > 0) {
-        const argsCommand = `set args ${programArgs.join(' ')}`;
-        argsOutput = await this.executeGdbCommand(session, argsCommand);
+      if (Array.isArray(programArgs) && programArgs.length > 0) {
+        const quotedArgs = programArgs.map((value) => JSON.stringify(String(value))).join(' ');
+        argsOutput = await this.queueGdbCommand(session, `set args ${quotedArgs}`);
       }
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Program loaded: ${normalizedPath}\n\nOutput:\n${loadOutput}${argsOutput ? '\n' + argsOutput : ''}`
-          }
-        ]
-      };
+
+      return textResult(
+        `Program loaded: ${normalizedPath}\n\nOutput:\n${loadOutput}${argsOutput ? `\n${argsOutput}` : ''}`
+      );
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to load program: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
+      return errorResult(`Failed to load program: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private async handleGdbCommand(args: any) {
+  async handleGdbCommand(args) {
     const { sessionId, command } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      const output = await this.executeGdbCommand(session, command);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Command: ${command}\n\nOutput:\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to execute command: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+    return this.runSessionCommand(sessionId, command, `Command: ${command}`, 'Failed to execute command');
   }
 
-  private async handleGdbTerminate(args: any) {
+  async handleGdbConnect(args) {
+    const { sessionId, target, extendedRemote = false } = args;
+    const command = `${extendedRemote ? 'target extended-remote' : 'target remote'} ${target}`;
+    return this.runSessionCommand(sessionId, command, `Connected to ${target}`, 'Failed to connect to target');
+  }
+
+  async handleGdbReadRegister(args) {
+    const { sessionId, register } = args;
+    return this.runSessionCommand(
+      sessionId,
+      `info registers ${register}`,
+      `Register ${register}:`,
+      `Failed to read register ${register}`
+    );
+  }
+
+  async handleGdbReadMemory(args) {
+    const { sessionId, address, format = 'wx', count = 1 } = args;
+    return this.runSessionCommand(
+      sessionId,
+      `x/${count}${format} ${address}`,
+      `Memory ${address} (${count}${format}):`,
+      `Failed to read memory at ${address}`
+    );
+  }
+
+  async handleGdbTerminate(args) {
     const { sessionId } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
+    if (!this.getSession(sessionId)) {
+      return errorResult(`No active GDB session with ID: ${sessionId}`);
     }
-    
+
     try {
       await this.terminateGdbSession(sessionId);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `GDB session terminated: ${sessionId}`
-          }
-        ]
-      };
+      return textResult(`GDB session terminated: ${sessionId}`);
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to terminate GDB session: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
+      return errorResult(
+        `Failed to terminate GDB session: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   }
 
-  private async handleGdbListSessions() {
-    const sessions = Array.from(activeSessions.entries()).map(([id, session]) => ({
-      id,
+  async handleGdbListSessions() {
+    const sessions = Array.from(activeSessions.values()).map((session) => ({
+      id: session.id,
       target: session.target || 'No program loaded',
-      workingDir: session.workingDir || process.cwd()
+      workingDir: session.workingDir || process.cwd(),
     }));
-    
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Active GDB Sessions (${sessions.length}):\n\n${JSON.stringify(sessions, null, 2)}`
-        }
-      ]
-    };
+
+    return textResult(`Active GDB Sessions (${sessions.length}):\n\n${JSON.stringify(sessions, null, 2)}`);
   }
 
-  private async handleGdbAttach(args: any) {
+  async handleGdbAttach(args) {
     const { sessionId, pid } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      const output = await this.executeGdbCommand(session, `attach ${pid}`);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Attached to process ${pid}\n\nOutput:\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to attach to process: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+    return this.runSessionCommand(sessionId, `attach ${pid}`, `Attached to process ${pid}`, 'Failed to attach');
   }
 
-  private async handleGdbLoadCore(args: any) {
+  async handleGdbLoadCore(args) {
     const { sessionId, program, corePath } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
+    const resolved = this.getSessionOrError(sessionId);
+    if (!resolved.session) {
+      return resolved.response;
     }
-    
-    const session = activeSessions.get(sessionId)!;
-    
+
+    const session = resolved.session;
+
     try {
-      // First load the program
-      const fileOutput = await this.executeGdbCommand(session, `file "${program}"`);
-      
-      // Then load the core file
-      const coreOutput = await this.executeGdbCommand(session, `core-file "${corePath}"`);
-      
-      // Get backtrace to show initial state
-      const backtraceOutput = await this.executeGdbCommand(session, "backtrace");
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Core file loaded: ${corePath}\n\nOutput:\n${fileOutput}\n${coreOutput}\n\nBacktrace:\n${backtraceOutput}`
-          }
-        ]
-      };
+      const normalizedProgram =
+        session.workingDir && !path.isAbsolute(program)
+          ? path.resolve(session.workingDir, program)
+          : program;
+      const normalizedCore =
+        session.workingDir && !path.isAbsolute(corePath)
+          ? path.resolve(session.workingDir, corePath)
+          : corePath;
+
+      const fileOutput = await this.queueGdbCommand(session, `file "${normalizedProgram}"`);
+      const coreOutput = await this.queueGdbCommand(session, `core-file "${normalizedCore}"`);
+      const backtraceOutput = await this.queueGdbCommand(session, 'backtrace');
+
+      return textResult(
+        `Core file loaded: ${normalizedCore}\n\nOutput:\n${fileOutput}\n${coreOutput}\n\nBacktrace:\n${backtraceOutput}`
+      );
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to load core file: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
+      return errorResult(`Failed to load core file: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private async handleGdbSetBreakpoint(args: any) {
+  async handleGdbSetBreakpoint(args) {
     const { sessionId, location, condition } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
+    const resolved = this.getSessionOrError(sessionId);
+    if (!resolved.session) {
+      return resolved.response;
     }
-    
-    const session = activeSessions.get(sessionId)!;
-    
+
+    const session = resolved.session;
+
     try {
-      // Set breakpoint
-      let command = `break ${location}`;
-      const output = await this.executeGdbCommand(session, command);
-      
-      // Set condition if provided
+      const output = await this.queueGdbCommand(session, `break ${location}`);
       let conditionOutput = '';
       if (condition) {
-        // Extract breakpoint number from output (assumes format like "Breakpoint 1 at...")
         const match = output.match(/Breakpoint (\d+)/);
         if (match && match[1]) {
-          const bpNum = match[1];
-          const conditionCommand = `condition ${bpNum} ${condition}`;
-          conditionOutput = await this.executeGdbCommand(session, conditionCommand);
+          conditionOutput = await this.queueGdbCommand(session, `condition ${match[1]} ${condition}`);
         }
       }
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Breakpoint set at: ${location}${condition ? ` with condition: ${condition}` : ''}\n\nOutput:\n${output}${conditionOutput ? '\n' + conditionOutput : ''}`
-          }
-        ]
-      };
+
+      return textResult(
+        `Breakpoint set at: ${location}${condition ? ` with condition: ${condition}` : ''}\n\nOutput:\n${output}${
+          conditionOutput ? `\n${conditionOutput}` : ''
+        }`
+      );
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to set breakpoint: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
+      return errorResult(`Failed to set breakpoint: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private async handleGdbContinue(args: any) {
-    const { sessionId } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      const output = await this.executeGdbCommand(session, "continue");
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Continued execution\n\nOutput:\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to continue execution: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+  async handleGdbContinue(args) {
+    return this.runSessionCommand(args.sessionId, 'continue', 'Continued execution', 'Failed to continue');
   }
 
-  private async handleGdbStep(args: any) {
-    const { sessionId, instructions = false } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      // Use stepi for instruction-level stepping, otherwise step
-      const command = instructions ? "stepi" : "step";
-      const output = await this.executeGdbCommand(session, command);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Stepped ${instructions ? 'instruction' : 'line'}\n\nOutput:\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to step: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+  async handleGdbStep(args) {
+    const command = args.instructions ? 'stepi' : 'step';
+    return this.runSessionCommand(
+      args.sessionId,
+      command,
+      `Stepped ${args.instructions ? 'instruction' : 'line'}`,
+      'Failed to step'
+    );
   }
 
-  private async handleGdbNext(args: any) {
-    const { sessionId, instructions = false } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      // Use nexti for instruction-level stepping, otherwise next
-      const command = instructions ? "nexti" : "next";
-      const output = await this.executeGdbCommand(session, command);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Stepped over ${instructions ? 'instruction' : 'function call'}\n\nOutput:\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to step over: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+  async handleGdbNext(args) {
+    const command = args.instructions ? 'nexti' : 'next';
+    return this.runSessionCommand(
+      args.sessionId,
+      command,
+      `Stepped over ${args.instructions ? 'instruction' : 'function call'}`,
+      'Failed to step over'
+    );
   }
 
-  private async handleGdbFinish(args: any) {
-    const { sessionId } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      const output = await this.executeGdbCommand(session, "finish");
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Finished current function\n\nOutput:\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to finish function: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+  async handleGdbFinish(args) {
+    return this.runSessionCommand(args.sessionId, 'finish', 'Finished current function', 'Failed to finish function');
   }
 
-  private async handleGdbBacktrace(args: any) {
-    const { sessionId, full = false, limit } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
+  async handleGdbBacktrace(args) {
+    let command = args.full ? 'backtrace full' : 'backtrace';
+    if (typeof args.limit === 'number') {
+      command += ` ${args.limit}`;
     }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      // Build backtrace command with options
-      let command = full ? "backtrace full" : "backtrace";
-      if (typeof limit === 'number') {
-        command += ` ${limit}`;
-      }
-      
-      const output = await this.executeGdbCommand(session, command);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Backtrace${full ? ' (full)' : ''}${limit ? ` (limit: ${limit})` : ''}:\n\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to get backtrace: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+    return this.runSessionCommand(args.sessionId, command, 'Backtrace:', 'Failed to get backtrace');
   }
 
-  private async handleGdbPrint(args: any) {
-    const { sessionId, expression } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      const output = await this.executeGdbCommand(session, `print ${expression}`);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Print ${expression}:\n\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to print expression: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+  async handleGdbPrint(args) {
+    return this.runSessionCommand(
+      args.sessionId,
+      `print ${args.expression}`,
+      `Print ${args.expression}:`,
+      'Failed to print expression'
+    );
   }
 
-  private async handleGdbExamine(args: any) {
-    const { sessionId, expression, format = 'x', count = 1 } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      // Format examine command: x/[count][format] [expression]
-      const command = `x/${count}${format} ${expression}`;
-      const output = await this.executeGdbCommand(session, command);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Examine ${expression} (format: ${format}, count: ${count}):\n\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to examine memory: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+  async handleGdbExamine(args) {
+    const command = `x/${args.count || 1}${args.format || 'x'} ${args.expression}`;
+    return this.runSessionCommand(
+      args.sessionId,
+      command,
+      `Examine ${args.expression} (format: ${args.format || 'x'}, count: ${args.count || 1}):`,
+      'Failed to examine memory'
+    );
   }
 
-  private async handleGdbInfoRegisters(args: any) {
-    const { sessionId, register } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
-    }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    try {
-      // Build info registers command, optionally with specific register
-      const command = register ? `info registers ${register}` : `info registers`;
-      const output = await this.executeGdbCommand(session, command);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Register info${register ? ` for ${register}` : ''}:\n\n${output}`
-          }
-        ]
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to get register info: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
-    }
+  async handleGdbInfoRegisters(args) {
+    const command = args.register ? `info registers ${args.register}` : 'info registers';
+    return this.runSessionCommand(
+      args.sessionId,
+      command,
+      `Register info${args.register ? ` for ${args.register}` : ''}:`,
+      'Failed to get register info'
+    );
   }
 
-  private async handleGdbListSource(args: any) {
-    const { sessionId, location, lineCount = 10 } = args;
-    
-    if (!activeSessions.has(sessionId)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `No active GDB session with ID: ${sessionId}`
-          }
-        ],
-        isError: true
-      };
+  async handleGdbListSource(args) {
+    const { sessionId, location } = args;
+    const resolved = this.getSessionOrError(sessionId);
+    if (!resolved.session) {
+      return resolved.response;
     }
-    
-    const session = activeSessions.get(sessionId)!;
-    
+
+    const session = resolved.session;
+    const command = location ? `list ${location}` : 'list';
+
     try {
-      // Build list command with optional location and line count
-      const command = location ? `list ${location}` : 'list';
-      const output = await this.executeGdbCommand(session, command);
-      
-      // Parse output to extract file and line information
+      const output = await this.queueGdbCommand(session, command);
       const sourceInfo = await this.parseSourceInfoFromGdbOutput(session, output);
-      
-      // If we got valid source information, return it in a structured format
-      if (sourceInfo.filePath) {
-        return {
-          debug: {
-            sourceInfo
-          },
-          content: [
-            {
-              type: 'text',
-              text: `Source code ${location ? `at ${location}` : 'at current location'}:\n\n${output}`
-            },
-            {
-              type: 'source_location',
-              filePath: sourceInfo.filePath,
-              lineStart: sourceInfo.lineStart, 
-              vscodeUri: `vscode://file${sourceInfo.filePath}:${sourceInfo.lineStart}`,
-              lineEnd: sourceInfo.lineEnd,
-              currentLine: sourceInfo.currentLine
-            }
-          ]
-        };
+
+      if (!sourceInfo.filePath) {
+        return textResult(`Source code ${location ? `at ${location}` : 'at current location'}:\n\n${output}`);
       }
-      
-      // If we couldn't extract source information, just return the text output
+
       return {
+        debug: {
+          sourceInfo,
+        },
         content: [
           {
             type: 'text',
-            text: `Source code ${location ? `at ${location}` : 'at current location'}:\n\n${output}`
-          }
-        ]
+            text: `Source code ${location ? `at ${location}` : 'at current location'}:\n\n${output}`,
+          },
+          {
+            type: 'source_location',
+            filePath: sourceInfo.filePath,
+            lineStart: sourceInfo.lineStart,
+            lineEnd: sourceInfo.lineEnd,
+            currentLine: sourceInfo.currentLine,
+            vscodeUri: `vscode://file${sourceInfo.filePath}:${sourceInfo.lineStart}`,
+          },
+        ],
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Failed to list source: ${errorMessage}`
-          }
-        ],
-        isError: true
-      };
+      return errorResult(`Failed to list source: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  /**
-   * Parse GDB output to extract source code file path and line range
-   */
-  private async parseSourceInfoFromGdbOutput(session: GdbSession, output: string): Promise<{ filePath: string, lineStart: number, lineEnd: number, currentLine: number }> {
-    // Default return value when parsing fails
+  async runSessionCommand(sessionId, command, successLabel, errorLabel) {
+    const resolved = this.getSessionOrError(sessionId);
+    if (!resolved.session) {
+      return resolved.response;
+    }
+
+    try {
+      const output = await this.queueGdbCommand(resolved.session, command);
+      return textResult(`${successLabel}\n\n${output}`);
+    } catch (error) {
+      return errorResult(`${errorLabel}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async parseSourceInfoFromGdbOutput(session, output) {
     const defaultResult = { filePath: '', lineStart: 0, lineEnd: 0, currentLine: 0 };
-    
-    // Check if the output contains source lines
     if (!output.trim()) {
       return defaultResult;
     }
-    
+
     try {
-      // First, get the current location using 'info line'
-      // This gives us both the file and the current line in a reliable way
-      const infoLineOutput = await this.executeGdbCommand(session, 'info line');
-      
-      // Parse the file path and line number from info line output
-      // Example output: "Line 17 of \"crash.c\" starts at address 0x1149 <main+0> and ends at 0x1155 <main+12>."
+      const infoLineOutput = await this.queueGdbCommand(session, 'info line');
       const infoLineMatch = infoLineOutput.match(/Line (\d+) of "([^"]+)"/);
-      
+
       let filePath = '';
       let currentLine = 0;
-      
+
       if (infoLineMatch) {
-        currentLine = parseInt(infoLineMatch[1], 10);
+        currentLine = Number.parseInt(infoLineMatch[1], 10);
         filePath = infoLineMatch[2];
       } else {
-        // Fallback to info source if info line doesn't work
-        const infoOutput = await this.executeGdbCommand(session, 'info source');
+        const infoOutput = await this.queueGdbCommand(session, 'info source');
         const filePathMatch = infoOutput.match(/Current source file is (.*?)(?: |$)/);
         filePath = filePathMatch ? filePathMatch[1] : '';
       }
-      
-      // Now extract the line numbers from the list output
-      // Format for GDB list output is usually line numbers followed by the code:
-      // 10     void function_with_args(int a, int b) {
-      const lines = output.split('\n').filter(line => line.trim());
-      
-      // Detect if there's source code in the output
-      // Look for lines that start with numbers
-      const sourceLines = lines.filter(line => /^\s*\d+\s+/.test(line));
-      
+
+      const lines = output.split('\n').filter((line) => line.trim());
+      const sourceLines = lines.filter((line) => /^\s*\d+\s+/.test(line));
+
       if (sourceLines.length === 0) {
         return defaultResult;
       }
-      
-      // Extract line numbers from the first and last source lines
+
       const firstLineMatch = sourceLines[0].match(/^\s*(\d+)\s+/);
       const lastLineMatch = sourceLines[sourceLines.length - 1].match(/^\s*(\d+)\s+/);
-      
+
       if (firstLineMatch && lastLineMatch) {
         return {
           filePath,
-          lineStart: parseInt(firstLineMatch[1], 10),
-          lineEnd: parseInt(lastLineMatch[1], 10),
-          currentLine
+          lineStart: Number.parseInt(firstLineMatch[1], 10),
+          lineEnd: Number.parseInt(lastLineMatch[1], 10),
+          currentLine,
         };
       }
-    } catch (e) {
-      // If there's any error in parsing, continue with default result
+    } catch {
+      return defaultResult;
     }
-    
+
     return defaultResult;
   }
 
-  /**
-   * Execute a GDB command and wait for the response
-   */
-  private executeGdbCommand(session: GdbSession, command: string): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
+  runGdbCommand(session, command) {
+    return new Promise((resolve, reject) => {
       if (!session.ready) {
         reject(new Error('GDB session is not ready'));
         return;
       }
-      
-      // Write command to GDB's stdin
-      if (session.process.stdin) {
-        session.process.stdin.write(command + '\n');
-      } else {
-        reject(new Error('GDB stdin is not available'));
-        return;
-      }
-      
+
+      const escapedCommand = this.escapeMiString(command);
+      session.process.stdin.write(`-interpreter-exec console "${escapedCommand}"\n`);
+
       let output = '';
-      let responseComplete = false;
-      
-      // Create a one-time event handler for GDB output
-      const onLine = (line: string) => {
-        output += line + '\n';
-        
-        // Check if this line indicates the end of the GDB response
-        if (line.includes('(gdb)') || line.includes('^done') || line.includes('^error')) {
-          responseComplete = true;
-          
-          // If we've received the complete response, resolve the promise
-          if (responseComplete) {
-            // Remove the listener to avoid memory leaks
-            session.rl.removeListener('line', onLine);
-            resolve(output);
-          }
+      let settled = false;
+
+      const onLine = (line) => {
+        if (line.trim() === '(gdb)') {
+          return;
+        }
+
+        if (line.startsWith('^done')) {
+          settle(resolve, output.trim() || '(ok)');
+          return;
+        }
+
+        if (line.startsWith('^error')) {
+          const errorText = this.extractMiError(line);
+          settle(reject, new Error([output.trim(), errorText].filter(Boolean).join('\n')));
+          return;
+        }
+
+        if (line.startsWith('^running')) {
+          settle(resolve, output.trim() || '^running');
+          return;
+        }
+
+        const decodedLine = this.decodeMiOutputLine(line);
+        if (decodedLine.trim()) {
+          output += decodedLine.endsWith('\n') ? decodedLine : `${decodedLine}\n`;
         }
       };
-      
-      // Add the line handler to the readline interface
-      session.rl.on('line', onLine);
-      
-      // Set a timeout to prevent hanging
-      const timeout = setTimeout(() => {
-        session.rl.removeListener('line', onLine);
-        reject(new Error('GDB command timed out'));
-      }, 10000); // 10 second timeout
-      
-      // Handle GDB errors
-      const errorHandler = (data: Buffer) => {
+
+      const onStderr = (data) => {
         const errorText = data.toString();
-        output += `[stderr] ${errorText}\n`;
+        output += `[stderr] ${errorText}${errorText.endsWith('\n') ? '' : '\n'}`;
       };
-      
-      // Add error handler
-      if (session.process.stderr) {
-        session.process.stderr.once('data', errorHandler);
-      }
-      
-      // Clean up event handlers when the timeout expires
+
+      const onExit = (code, signal) => {
+        settle(reject, new Error(`GDB process exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'null'})`));
+      };
+
+      const timeout = setTimeout(() => {
+        settle(reject, new Error(`GDB command timed out: ${command}`));
+      }, 10000);
       timeout.unref();
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        session.rl.removeListener('line', onLine);
+        session.process.stderr.removeListener('data', onStderr);
+        session.process.removeListener('exit', onExit);
+      };
+
+      const settle = (callback, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+
+      session.rl.on('line', onLine);
+      session.process.stderr.on('data', onStderr);
+      session.process.on('exit', onExit);
     });
   }
 
-  /**
-   * Terminate a GDB session
-   */
-  private async terminateGdbSession(sessionId: string): Promise<void> {
-    if (!activeSessions.has(sessionId)) {
+  escapeMiString(value) {
+    return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  }
+
+  decodeMiString(value) {
+    try {
+      return JSON.parse(`"${value}"`);
+    } catch {
+      return value;
+    }
+  }
+
+  decodeMiOutputLine(line) {
+    const match = line.match(/^[~@&]"(.*)"$/);
+    if (!match) {
+      return line;
+    }
+    return this.decodeMiString(match[1]);
+  }
+
+  extractMiError(line) {
+    const match = line.match(/msg="((?:[^"\\]|\\.)*)"/);
+    return match ? this.decodeMiString(match[1]) : line;
+  }
+
+  async terminateGdbSession(sessionId) {
+    const session = this.getSession(sessionId);
+    if (!session) {
       throw new Error(`No active GDB session with ID: ${sessionId}`);
     }
-    
-    const session = activeSessions.get(sessionId)!;
-    
-    // Send quit command to GDB
-    try {
-      await this.executeGdbCommand(session, 'quit');
-    } catch (error) {
-      // Ignore errors from quit command, we'll force kill if needed
-    }
-    
-    // Force kill the process if it's still running
+
+    session.process.stdin.write('-gdb-exit\n');
+
+    await new Promise((resolve) => {
+      const timeout = setTimeout(resolve, 1000);
+      session.process.once('exit', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+
     if (!session.process.killed) {
       session.process.kill();
     }
-    
-    // Close the readline interface
+
     session.rl.close();
-    
-    // Remove from active sessions
     activeSessions.delete(sessionId);
   }
 
-  async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('GDB MCP server running on stdio');
+  async shutdown() {
+    for (const sessionId of Array.from(activeSessions.keys())) {
+      try {
+        await this.terminateGdbSession(sessionId);
+      } catch (error) {
+        console.error('[MCP Error] Failed to terminate session during shutdown:', error);
+      }
+    }
   }
 }
 
-// Create and run the server
 const server = new GdbServer();
 server.run().catch((error) => {
   console.error('Failed to start GDB MCP server:', error);

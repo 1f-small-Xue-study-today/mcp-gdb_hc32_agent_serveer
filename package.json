@@ -3,16 +3,14 @@
   "version": "0.1.3",
   "description": "MCP server for GDB debugging functionality",
   "type": "module",
-  "main": "build/index.js",
+  "main": "dist/index.js",
   "bin": {
-    "mcp-gdb": "build/index.js"
+    "mcp-gdb": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
-    "start": "node build/index.js",
-    "dev": "tsc-watch --onSuccess \"node build/index.js\"",
-    "lint": "eslint src/**/*.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "node scripts/build_mcp.js",
+    "start": "node dist/index.js",
+    "test": "echo \"No automated test suite configured\""
   },
   "keywords": [
     "gdb",
@@ -21,17 +19,8 @@
   ],
   "author": "Tasuku Suzuki",
   "license": "MIT",
-  "devDependencies": {
-    "@types/node": "^20.10.5",
-    "@typescript-eslint/eslint-plugin": "^6.15.0",
-    "@typescript-eslint/parser": "^6.15.0",
-    "eslint": "^8.56.0",
-    "tsc-watch": "^6.0.4",
-    "typescript": "^5.3.3"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0"
-  },
+  "devDependencies": {},
+  "dependencies": {},
   "directories": {
     "example": "examples"
   },
@@ -39,7 +28,7 @@
     "type": "git",
     "url": "git+https://github.com/signal-slot/mcp-gdb.git"
   },
-  "types": "./build/index.d.ts",
+  "types": "./dist/index.d.ts",
   "bugs": {
     "url": "https://github.com/signal-slot/mcp-gdb/issues"
   },
