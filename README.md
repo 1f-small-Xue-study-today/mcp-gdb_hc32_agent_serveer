@@ -1,65 +1,38 @@
 # MCP J-Link GDB Debug Runtime
 
-This repository packages a deterministic embedded debug pipeline for an AI agent or a human operator:
+This repository gives you a reproducible embedded debug path:
 
-`ELF -> GDB -> J-Link GDB Server -> target hardware`
+`ELF -> GDB -> J-Link GDB Server -> hardware`
 
-The project is built around `config/project.yaml`, the task order in `TASKS.md`, and the scripts in `scripts/`. The current implementation has been verified on a real target and can:
+Use this README for two things only:
 
-- load an ELF with symbols
-- start a SEGGER J-Link GDB server
-- attach with `arm-none-eabi-gdb`
-- read registers and memory from hardware
-- map program counters back to symbols from the ELF
-- expose GDB-backed operations through an MCP stdio server
+- bring the project up quickly on a new machine
+- understand where to implement or extend the runtime
 
-## What Changed In This Project
+## Quick Bring-Up
 
-Compared with the upstream generic MCP GDB package flow, this repository now includes a reproducible board-oriented runtime:
+### 1. Install the required tools
 
-- deterministic config loading from `config/project.yaml`
-- deterministic shell entrypoints for validation, build, J-Link startup, GDB attach, MCP smoke testing, and ELF analysis
-- centralized logging in `artifacts/logs/`
-- ELF symbol reports in `artifacts/symbol_reports/`
-- an offline-buildable MCP server in `src/index.ts` that does not depend on fetching the npm MCP SDK at runtime
-- service launch wrappers that keep the J-Link GDB server and MCP stdio server alive after the wrapper script exits
-- documented bring-up and troubleshooting history in `doc/bringup_plan.md` and `doc/troubleshooting.md`
-
-## Repository Layout
-
-- `config/project.yaml`: local machine and target configuration
-- `scripts/validate_env.sh`: verify toolchain, config, and required files
-- `scripts/build_mcp.sh`: build the MCP server into `dist/index.js`
-- `scripts/run_jlink_gdb_server.sh`: start the SEGGER J-Link GDB server on port `2331`
-- `scripts/run_mcp_stdio.sh`: start the MCP server in stdio mode
-- `scripts/test_gdb_attach.sh`: attach directly with GDB and read `pc`
-- `scripts/test_mcp_session.py`: exercise the MCP server over stdio and read register/memory data
-- `scripts/test_elf_symbols.sh`: generate ELF symbol and section reports
-- `artifacts/logs/`: raw execution logs
-- `artifacts/symbol_reports/`: symbol table and address-to-source reports
-
-## Requirements
-
-Before running the workflow, make sure the following are installed on the host:
+You need these available on the host:
 
 - Node.js and `npm`
 - Python 3 with `PyYAML`
 - SEGGER J-Link tools
-- an ARM-capable GDB client such as `arm-none-eabi-gdb`
-- ELF analysis tools such as `arm-none-eabi-nm` and `arm-none-eabi-objdump`, or compatible fallbacks available in `PATH`
+- `arm-none-eabi-gdb`
+- `arm-none-eabi-nm`
+- `arm-none-eabi-objdump`
+- `arm-none-eabi-addr2line`
 
-This project does not hardcode local tool paths. The actual binaries are taken from `config/project.yaml`.
+### 2. Fill in the project config
 
-## Configure The Project
+Edit `config/project.yaml` and set absolute paths for:
 
-Edit `config/project.yaml` and set the absolute paths and target settings for your machine:
-
-- `ELF_PATH`: firmware ELF with symbols
-- `JLINK_GDB_SERVER_PATH`: J-Link GDB server executable
-- `JLINK_DEVICE` or `DEVICE`: SEGGER device name
-- `JLINK_INTERFACE` or `INTERFACE`: `SWD` or `JTAG`
-- `JLINK_SPEED_KHZ` or `SPEED`: link speed in kHz
-- `GDB_PATH`: absolute path to `arm-none-eabi-gdb`
+- `ELF_PATH`
+- `JLINK_GDB_SERVER_PATH`
+- `JLINK_DEVICE` or `DEVICE`
+- `JLINK_INTERFACE` or `INTERFACE`
+- `JLINK_SPEED_KHZ` or `SPEED`
+- `GDB_PATH`
 
 Example:
 
@@ -72,190 +45,170 @@ JLINK_INTERFACE: 'SWD'
 INTERFACE: 'SWD'
 JLINK_SPEED_KHZ: 4000
 SPEED: 4000
-GDB_PATH: '/absolute/path/to/arm-none-eabi-gdb'
+GDB_PATH: '/opt/homebrew/bin/arm-none-eabi-gdb'
 ```
 
-## Quick Start For A New Teammate
+### 3. Run the workflow in order
 
-Run the workflow from the repository root in the same order as `TASKS.md`.
-
-### 1. Validate the local environment
+From the repository root:
 
 ```bash
 ./scripts/validate_env.sh
-```
-
-Success criteria:
-
-- exits with code `0`
-- confirms the configured ELF exists
-- resolves the J-Link GDB server binary
-- resolves the GDB binary
-
-Log:
-
-- `artifacts/logs/validate_env.log`
-
-### 2. Build the MCP server
-
-```bash
 ./scripts/build_mcp.sh
-```
-
-Success criteria:
-
-- `dist/index.js` exists
-- `node --check dist/index.js` passes
-
-Log:
-
-- `artifacts/logs/build_mcp.log`
-
-### 3. Start the J-Link GDB server
-
-```bash
 ./scripts/run_jlink_gdb_server.sh
-```
-
-Success criteria:
-
-- the process stays alive
-- `artifacts/logs/jlink_gdb_server.log` contains `Waiting for GDB connection`
-
-Notes:
-
-- the script writes a PID file under `artifacts/runtime/`
-- if the board is disconnected or busy, this step fails and the workflow should stop
-
-### 4. Start the MCP server in stdio mode
-
-```bash
-./scripts/run_mcp_stdio.sh
-```
-
-Success criteria:
-
-- the process stays alive
-- `artifacts/logs/mcp_stdio.log` contains `GDB MCP server running on stdio`
-
-### 5. Verify direct GDB attach
-
-```bash
 ./scripts/test_gdb_attach.sh
-```
-
-What it does:
-
-- loads the configured ELF into GDB
-- connects to `localhost:2331`
-- halts the target
-- prints the `pc` register
-- reads four words at `$pc`
-
-Success criteria:
-
-- the log contains a valid `pc` value
-- there are no attach errors from GDB
-
-Log:
-
-- `artifacts/logs/gdb_attach.log`
-
-### 6. Verify the MCP path
-
-```bash
+./scripts/test_elf_symbols.sh
+./scripts/run_mcp_stdio.sh
 python3 scripts/test_mcp_session.py
 ```
 
-What it does:
+### 4. Check the logs
 
-- starts an MCP stdio session
-- initializes the MCP protocol
-- calls `gdb_start`
-- calls `gdb_load`
-- calls `gdb_connect`
-- calls `gdb_read_register` for `pc`
-- calls `gdb_read_memory` at `$pc`
-- terminates the session cleanly
+The scripts currently write their output to log files instead of printing much to the terminal. After each step, check:
 
-Success criteria:
-
-- each MCP request returns a JSON-RPC success response
-- the session returns real register and memory data from the target
-
-Log:
-
+- `artifacts/logs/validate_env.log`
+- `artifacts/logs/build_mcp.log`
+- `artifacts/logs/jlink_gdb_server.log`
+- `artifacts/logs/gdb_attach.log`
+- `artifacts/logs/elf_symbols.log`
+- `artifacts/logs/mcp_stdio.log`
 - `artifacts/logs/mcp_session.log`
 
-### 7. Generate ELF reports
-
-```bash
-./scripts/test_elf_symbols.sh
-```
-
-Outputs:
+Generated ELF reports are written to:
 
 - `artifacts/symbol_reports/symbols.txt`
 - `artifacts/symbol_reports/sections.txt`
 - `artifacts/symbol_reports/addr2line_report.txt`
 
-## Typical End-to-End Usage
+### 5. What success looks like
 
-If you want the full sequence in one manual session:
+Bring-up is healthy when:
 
-```bash
-./scripts/validate_env.sh
-./scripts/build_mcp.sh
-./scripts/run_jlink_gdb_server.sh
-./scripts/run_mcp_stdio.sh
-./scripts/test_gdb_attach.sh
-python3 scripts/test_mcp_session.py
-./scripts/test_elf_symbols.sh
-```
+- `validate_env.sh` resolves the ELF, J-Link server, and GDB binaries
+- `build_mcp.sh` produces `dist/index.js`
+- `run_jlink_gdb_server.sh` leaves the SEGGER server running on `localhost:2331`
+- `test_gdb_attach.sh` reads a valid `pc` register and memory at `$pc`
+- `test_mcp_session.py` completes `initialize`, `tools/list`, `gdb_start`, `gdb_load`, `gdb_connect`, `gdb_read_register`, `gdb_read_memory`, and `gdb_terminate`
 
-## Using The MCP Server From Another Agent Or Client
+If a step fails, stop there and check:
 
-The MCP server entrypoint is:
-
-```bash
-node dist/index.js
-```
-
-It uses stdio JSON-RPC framing and exposes GDB-backed tools including:
-
-- `gdb_start`
-- `gdb_load`
-- `gdb_command`
-- `gdb_connect`
-- `gdb_read_register`
-- `gdb_read_memory`
-- `gdb_terminate`
-
-For a working example of the protocol flow, use `scripts/test_mcp_session.py`.
-
-## Logs And Debug Artifacts
-
-The project writes runtime evidence under `artifacts/`:
-
-- `artifacts/logs/validate_env.log`
-- `artifacts/logs/build_mcp.log`
-- `artifacts/logs/jlink_gdb_server.log`
-- `artifacts/logs/mcp_stdio.log`
-- `artifacts/logs/gdb_attach.log`
-- `artifacts/logs/mcp_session.log`
-- `artifacts/logs/elf_symbols.log`
-- `artifacts/symbol_reports/`
-
-If a task fails, check the matching log first, then review:
-
-- `doc/bringup_plan.md`
 - `doc/troubleshooting.md`
+- `doc/bringup_plan.md`
 
-## Known Notes
+## How To Implement It
 
-- Source paths embedded in the current ELF point to a Windows build machine, so GDB may warn that source files are missing locally even when symbol resolution works correctly.
-- This repository is intended for non-intrusive debug operations. Do not add flashing or persistent target reconfiguration without explicit approval.
-- The scripts do not assume the board is always connected. If hardware access is unavailable, the workflow is expected to fail during J-Link startup or attach validation.
+The implementation is split into four layers. Extend them in this order.
+
+### 1. Configuration layer
+
+Files:
+
+- `config/project.yaml`
+- `scripts/project_config.py`
+- `scripts/common.sh`
+
+Purpose:
+
+- keep all machine-specific paths and target settings in one place
+- normalize aliases like `DEVICE` and `JLINK_DEVICE`
+- give every script the same config contract
+
+Rule:
+
+- do not hardcode tool paths anywhere else
+
+### 2. Deterministic workflow layer
+
+Files:
+
+- `scripts/validate_env.sh`
+- `scripts/build_mcp.sh`
+- `scripts/run_jlink_gdb_server.sh`
+- `scripts/run_mcp_stdio.sh`
+- `scripts/test_gdb_attach.sh`
+- `scripts/test_elf_symbols.sh`
+- `scripts/test_mcp_session.py`
+
+Purpose:
+
+- provide one script per operation
+- make bring-up reproducible
+- leave a log for every step
+
+Rule:
+
+- if you add a new capability, add a deterministic script or smoke test for it
+
+### 3. MCP server layer
+
+Files:
+
+- `src/index.ts`
+- `dist/index.js`
+
+Purpose:
+
+- accept MCP stdio JSON-RPC requests
+- advertise tools through `tools/list`
+- manage one live GDB process per session
+- translate MCP tool calls into GDB commands
+
+Key flow:
+
+1. MCP client sends `initialize`
+2. MCP client sends `tools/list`
+3. MCP client sends `tools/call`
+4. the server dispatches to a handler like `gdb_start` or `gdb_read_memory`
+5. the handler runs a GDB command and returns text output as the MCP result
+
+Rule:
+
+- prove the direct GDB path first, then add new MCP tools on top
+
+### 4. Hardware bridge layer
+
+Files:
+
+- `scripts/run_jlink_gdb_server.sh`
+- J-Link GDB Server configured in `config/project.yaml`
+
+Purpose:
+
+- bridge GDB to the target hardware
+
+Important distinction:
+
+- the MCP server does not talk to hardware directly
+- GDB talks to J-Link
+- J-Link talks to the board
+
+## Where To Extend The Project
+
+If you want to add features, these are the normal places:
+
+- new MCP tool: add a tool definition and handler in `src/index.ts`
+- new validation rule: add it to `scripts/validate_env.sh`
+- new attach or smoke test: add a script under `scripts/`
+- new ELF report: extend `scripts/test_elf_symbols.sh`
+- new troubleshooting guidance: update `doc/troubleshooting.md`
+
+Good next additions:
+
+- better operator-facing console output while keeping logs
+- richer MCP tools like `gdb_backtrace`, `gdb_print`, and `gdb_continue`
+- clearer error handling for missing hardware or dead sessions
+
+## Minimal Mental Model
+
+```text
+MCP client
+  -> MCP server (src/index.ts)
+  -> GDB process
+  -> J-Link GDB server
+  -> target hardware
+```
+
+The ELF is loaded by GDB so register values, addresses, and PCs can be mapped back to symbols and source information.
 
 ## License
 
